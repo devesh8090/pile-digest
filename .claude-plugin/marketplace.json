@@ -1,0 +1,12 @@
+{
+  "name": "pile-digest",
+  "owner": { "name": "pile-digest contributors" },
+  "plugins": [
+    {
+      "name": "pile-digest",
+      "source": "./",
+      "description": "Understand large, messy document piles cheaply: local triage, a cheap model for bulk reading, a compact digest for the main model.",
+      "category": "productivity"
+    }
+  ]
+}

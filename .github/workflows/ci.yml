@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install poppler (the only required system tool)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y poppler-utils; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install poppler; fi
+      - name: Unit and pipeline tests (fake claude CLI, no network)
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke test
+        run: python skills/pile-digest/scripts/pd.py --help
+
+  minimal-tools:
+    # Optional tools absent: the pipeline must still work on poppler alone.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - name: Hide optional tools
+        run: |
+          for t in qpdf mutool gs soffice libreoffice convert magick 7z 7zz bsdtar; do
+            echo "PILE_DIGEST_$(echo $t | tr a-z A-Z)_BIN=/nonexistent" >> "$GITHUB_ENV"
+          done
+      - run: python -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check .

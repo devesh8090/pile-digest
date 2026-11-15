@@ -1,0 +1,11 @@
+# Tooling configuration only: pile-digest is a Claude Code skill, not a pip package.
+[tool.ruff]
+line-length = 145
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E731", "B008", "B023", "B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

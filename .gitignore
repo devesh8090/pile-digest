@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pile-digest-id
+.pile-digest-loose-id
+.ruff_cache/
