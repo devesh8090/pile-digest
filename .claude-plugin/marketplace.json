@@ -1,6 +1,9 @@
 {
   "name": "pile-digest",
-  "owner": { "name": "pile-digest contributors" },
+  "owner": {
+    "name": "Devesh Singh Chauhan",
+    "url": "https://github.com/devesh8090"
+  },
   "plugins": [
     {
       "name": "pile-digest",

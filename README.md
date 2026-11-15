@@ -1,5 +1,9 @@
 # pile-digest
 
+[![CI](https://github.com/devesh8090/pile-digest/actions/workflows/ci.yml/badge.svg)](https://github.com/devesh8090/pile-digest/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
+
 **A Claude Code skill that lets Claude understand a big, messy pile of documents without using up your usage window.**
 
 Lecture slides, scanned or handwritten notes, book chapters, reports, manuals, Office files, photos of whiteboards, zip files of all of the above. Point pile-digest at the folder and Claude can study it, check it and write from it: structured study notes, a summary report, or your own output format. Free local tools do everything they can, a cheap model does the bulk reading, and the expensive model spends its tokens only where they pay off.
@@ -74,13 +78,13 @@ Nothing is spent without your go-ahead:
 
 **As a personal skill** (gives `/pile-digest`):
 ```sh
-git clone https://github.com/<owner>/pile-digest.git
+git clone https://github.com/devesh8090/pile-digest.git
 cd pile-digest && ./install.sh          # symlinks skills/pile-digest into ~/.claude/skills
 ```
 
 **As a plugin:**
 ```
-/plugin marketplace add <owner>/pile-digest
+/plugin marketplace add devesh8090/pile-digest
 /plugin install pile-digest@pile-digest
 ```
 Plugin skills are namespaced, so the command becomes `/pile-digest:pile-digest`; Claude also triggers the skill on its own when you ask it to digest a folder of documents.

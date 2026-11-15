@@ -9,3 +9,5 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - Converters for PDF, images, Office/ODF, EPUB, HTML, RTF, notebooks, text and code, email and mbox, archives (zip, tar, gz, bz2, xz, 7z, rar), DjVu, PS/EPS and XPS, each with a graceful fallback.
 - Fresh single-turn `claude -p` workers with inline images and a usage ledger, plus budget, usage-window and disk guards.
 - Built-in `study-notes` and `summary-report` profiles, and user profiles with `post_build` commands.
+
+[1.0.0]: https://github.com/devesh8090/pile-digest/releases/tag/v1.0.0

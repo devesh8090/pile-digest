@@ -2,5 +2,20 @@
   "name": "pile-digest",
   "version": "1.0.0",
   "description": "Understand large, messy document piles cheaply: local triage, a cheap model for bulk reading, a compact digest for the main model.",
-  "license": "MIT"
+  "author": {
+    "name": "Devesh Singh Chauhan",
+    "url": "https://github.com/devesh8090"
+  },
+  "homepage": "https://github.com/devesh8090/pile-digest",
+  "repository": "https://github.com/devesh8090/pile-digest",
+  "license": "MIT",
+  "keywords": [
+    "documents",
+    "pdf",
+    "ocr",
+    "study-notes",
+    "summarization",
+    "token-efficiency",
+    "skill"
+  ]
 }
