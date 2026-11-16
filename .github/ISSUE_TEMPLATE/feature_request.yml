@@ -1,5 +1,5 @@
 name: Feature request
-description: A new input type, output profile, or improvement
+description: A new input type, a cheaper or more careful reading strategy, or another improvement
 labels: [enhancement]
 body:
   - type: textarea

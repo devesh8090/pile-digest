@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 
 from . import ledger, parse, raster, worker
 from .pile import Pile, load_prompt, wait_note
-from .textutil import first_line_summary
+from .textutil import content_tokens, first_line_summary, overlap
 from .triage import FREE_CLASSES, SKIP_CLASSES, VISION_CLASSES
 from .util import free_bytes, now_iso, read_json, sha256_text, write_json
 
@@ -31,12 +31,23 @@ class Stop(Exception):
 
 
 class RunContext:
-    def __init__(self, pile: Pile, *, budget: Optional[int] = None, run_id: Optional[str] = None):
+    def __init__(self, pile: Pile, *, budget: Optional[int] = None, run_id: Optional[str] = None,
+                 approval_cap: bool = False):
         self.pile = pile
         self.cfg = pile.cfg
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
         self.budget = budget if budget is not None else self.cfg.get("budget_tokens")
         self.spent = 0
+        # Spend since the user's approval may not run past the approved amount
+        # by more than run_overrun_factor; the run then stops and asks again.
+        self.cap: Optional[int] = None
+        self.base_spent = 0
+        appr = pile.state().get("approved") if approval_cap else None
+        if appr:
+            total = int(appr.get("total_tokens") or (appr.get("bulk_tokens", 0) + appr.get("strong_tokens", 0)))
+            self.approved = total
+            self.cap = int(total * float(self.cfg.get("run_overrun_factor", 1.25))) + 10000
+            self.base_spent = ledger.spent_since(pile.ledger_path, appr)
         self.stop_reason: Optional[str] = None
         self.stop_detail = ""
         self.lock = threading.Lock()
@@ -60,6 +71,13 @@ class RunContext:
             return self.stop_reason
         if self.budget and self.spent + est_tokens > self.budget:
             self.stop("budget", f"the token budget for this run ({self.budget:,}) would be exceeded")
+        elif self.cap and self.base_spent + self.spent + est_tokens > self.cap:
+            from .util import human_tokens as ht
+
+            self.stop("approval", f"spend since approval would pass the approved ~{ht(self.approved)} tokens by more than "
+                      f"{float(self.cfg.get('run_overrun_factor', 1.25)) - 1:.0%} (spent ~{ht(self.base_spent + self.spent)}). "
+                      f"Show the user `pd.py estimate {self.pile.id}` and, if they agree, `pd.py approve {self.pile.id}` "
+                      "(or `--add <tokens>`), then run again")
         elif self.last_rate and self.last_rate.get("utilization") is not None:
             u = float(self.last_rate["utilization"])
             if u >= float(self.cfg["max_window_utilization"]):
@@ -125,6 +143,11 @@ def save_result(pile: Pile, page: dict, parsed: dict, *, model: str, level: str,
     }
     if old and old.get("spot") and level == old.get("level"):
         meta["spot"] = old["spot"]
+    # Verdicts, spot-check history and review notes belong to the page, not to
+    # one reading of it: a new version keeps them.
+    for k in ("verifications", "verified", "spots", "rejected"):
+        if old and old.get(k):
+            meta[k] = old[k]
     from .util import atomic_write_text
 
     atomic_write_text(rd / f"{page['page_id']}.md", parse.render_result_md(page, parsed, model, level))
@@ -220,15 +243,16 @@ class Batch:
 
         if self.mode == "summarize":
             return sum(min(len(p.get("text", "")), 1800) // 4 + 120 for p in self.pages)
-        n = sum(page_image_tokens(p, cfg) * (2 if self.level in ("tiles", "strong") else 1) for p in self.pages)
-        return n + 800 * len(self.pages)
+        n = sum(page_image_tokens(p, cfg) * (2 if self.level == "tiles" else 1) for p in self.pages)
+        extra = 2400 if self.level == "strong" else 800
+        return n + extra * len(self.pages)
 
 
 def page_header(pile: Pile, p: dict, level: str, note: str = "") -> str:
     lines = [f"PAGE {p['page_id']}", f"(source: {p.get('relpath', '?')}, page {p['index']})"]
     if p.get("lowres_source"):
         lines.append("Note: this page was scanned at low resolution.")
-    if level in ("tiles", "strong"):
+    if level == "tiles" or p.get("tall"):
         lines.append("The page is split into overlapping horizontal tiles, top to bottom, for higher resolution.")
     if note:
         lines.append(note)
@@ -247,7 +271,7 @@ def build_blocks(pile: Pile, batch: Batch, outdir: Path) -> Optional[List[dict]]
             blocks.append(worker.text_block(f"PAGE {p['page_id']}\n(source: {p.get('relpath', '?')}, part {p['index']})\n"
                                             + p.get("text", "")[:1800]))
         return blocks
-    tiles = batch.level in ("tiles", "strong")
+    tiles = batch.level == "tiles"
     if batch.mode == "spotcheck":
         blocks.append(worker.text_block(f"Audit these {len(batch.pages)} transcription(s)."))
     else:
@@ -258,20 +282,60 @@ def build_blocks(pile: Pile, batch: Batch, outdir: Path) -> Optional[List[dict]]
         if not imgs:
             return None
         note = ""
+        earlier = ""
         if batch.mode == "transcribe" and batch.level in ("tiles", "strong"):
             prev = pile.result(p["page_id"]) or {}
-            issues = [f"{f['kind']}: {f['note']}" for f in (prev.get("flags") or [])[:6] if f.get("note")]
+            issues = [f"{f['kind']}: {f['note']}" for f in parse.claims(prev)[:6] if f.get("note")]
             if issues:
                 note = "A previous reading had trouble with: " + "; ".join(issues)
+            if batch.level == "strong":
+                body = result_body(pile, p["page_id"])
+                if body.strip() and not prev.get("no_image"):
+                    earlier = ("EARLIER TRANSCRIPTION of this page by a cheaper model. It may contain misreadings; the "
+                               "image is the authority. Keep what is right, correct what is wrong, and never replace "
+                               "it with content that is not on this page:\n" + body[:6000] + "\nEND OF EARLIER TRANSCRIPTION")
         blocks.append(worker.text_block(page_header(pile, p, batch.level if batch.mode == "transcribe" else "", note)))
         for im in imgs:
             blocks.append(worker.image_block(im))
             n_images += 1
+        if earlier:
+            blocks.append(worker.text_block(earlier))
         if batch.mode == "spotcheck":
             body = pile.result_text(p["page_id"]).split("\n\n", 1)
             content = body[1] if len(body) > 1 else body[0]
             blocks.append(worker.text_block("TRANSCRIPTION TO AUDIT:\n" + content[:12000] + "\nEND OF TRANSCRIPTION"))
+    if n_images < len(batch.pages):
+        return None  # never send a batch with a page whose image is missing
     return blocks
+
+
+def result_body(pile: Pile, pid: str) -> str:
+    """A stored transcription without its small header."""
+    parts = pile.result_text(pid).split("\n\n", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def accept_escalation(page: dict, old_body: str, new: dict) -> Optional[str]:
+    """Why a higher-level reading must NOT replace the current one (None = accept).
+
+    A higher rung once returned a different page's content with high confidence.
+    A real re-reading of the same page shares much of its words and numbers with
+    the earlier reading and, where there is one, with the page's text layer."""
+    if new.get("kind") in ("blank", "figure"):
+        return None
+    nt = content_tokens(new.get("content", ""))
+    if len(nt) < 6:
+        return None
+    text = page.get("text") or ""
+    if len(text.strip()) >= 40:
+        tl = content_tokens(text)
+        ot = content_tokens(old_body)
+        if len(tl) >= 8 and overlap(nt, tl) < 0.12 and overlap(ot, tl) >= 0.3:
+            return "the escalated reading shares almost nothing with the page's text layer, while the earlier one did"
+    ot = content_tokens(old_body)
+    if len(ot) >= 15 and overlap(nt, ot) < 0.15:
+        return "the escalated reading shares almost nothing with the earlier reading of this page"
+    return None
 
 
 def make_batches(pages: List[dict], *, mode: str, level: str, model: str, stage: str, size: int) -> List[Batch]:
@@ -312,7 +376,8 @@ def execute(ctx: RunContext, batches: List[Batch], label: str) -> dict:
             blocks = build_blocks(pile, b, outdir)
             if blocks is None:
                 return b, None, "render"
-            wr = worker.call(b.model, prompts[b.mode], blocks, timeout=float(cfg["call_timeout_s"]))
+            wr = worker.call(b.model, prompts[b.mode], blocks, timeout=float(cfg["call_timeout_s"]),
+                             prompt_cache=bool(cfg.get("worker_prompt_cache", False)))
             return b, wr, None
         finally:
             if not cfg.get("keep_renders"):
@@ -355,18 +420,30 @@ def execute(ctx: RunContext, batches: List[Batch], label: str) -> dict:
                 parsed, problems = parse.parse_blocks(wr.text, ids, mode=pmode)
                 if wr.stop_reason == "max_tokens" and len(b.pages) > 1:
                     parsed = {}  # truncated: redo in smaller pieces
+                again = []
                 for p in b.pages:
                     got = parsed.get(p["page_id"])
                     if got is None:
                         continue
+                    if b.mode == "transcribe" and parse.no_image_reply(got) and b.attempt < 1:
+                        # The model claims it got no image (seen on dark scans). Ask again,
+                        # one page per call, at the same level instead of escalating.
+                        again.append(p)
+                        stats["no_image_retry"] += 1
+                        continue
+                    if b.mode == "transcribe" and parse.no_image_reply(got):
+                        got = dict(got)
+                        got["no_image"] = True
                     _apply(pile, b, p, got, stats)
+                for p in again:
+                    queue.append(Batch([p], b.mode, b.level, b.model, b.stage, b.attempt + 1))
                 missing = [p for p in b.pages if p["page_id"] not in parsed]
                 if missing:
                     stats["parse_problems"] += len(missing)
                     _retry_or_fail(pile, queue, Batch(missing, b.mode, b.level, b.model, b.stage, b.attempt),
                                    max_retries, "unparseable answer", stats)
                 done += 1
-                stats["pages_ok"] += len(parsed)
+                stats["pages_ok"] += len(parsed) - len(again)
                 ctx.save_progress(label, done, total)
                 _progress(ctx, label, done, total, stats)
     shutil.rmtree(render_root, ignore_errors=True)
@@ -414,26 +491,46 @@ def _apply(pile: Pile, b: Batch, p: dict, got: dict, stats: Counter) -> None:
     if b.mode == "summarize":
         garbled = any("garbled" in (f.get("note", "") + f.get("kind", "")).lower() for f in got.get("flags", []))
         if garbled:
-            pile.set_override(p["page_id"], "vision", "text layer looked garbled to the summariser")
+            pile.set_override(p["page_id"], "vision", "text layer looked garbled to the summariser", auto=True)
             stats["reclassified"] += 1
             return
         save_result(pile, p, got, model=b.model, level="text", stage=b.stage, content=p["text"])
         return
     if b.mode == "spotcheck":
-        spot = {"verdict": got["verdict"], "differences": got.get("differences", []), "model": b.model, "at": now_iso()}
+        cur = pile.result(p["page_id"]) or {}
+        spot = {"verdict": got["verdict"], "differences": got.get("differences", []), "model": b.model, "at": now_iso(),
+                "level": cur.get("level")}
+        spots = list(cur.get("spots") or []) + [{k: spot[k] for k in ("verdict", "level", "model", "at")}]
         if got["verdict"] == "mismatch":
             if got.get("corrected"):
                 from .util import atomic_write_text
 
                 atomic_write_text(pile.results_dir / f"{p['page_id']}.suggested.md", got["corrected"] + "\n")
                 spot["suggested"] = True
-            mark(pile, p["page_id"], spot=spot, status="needs-main", review_reason="spot check found a mismatch")
+            mark(pile, p["page_id"], spot=spot, spots=spots, status="needs-main",
+                 review_reason="spot check found a mismatch")
             stats["mismatch"] += 1
         else:
-            mark(pile, p["page_id"], spot=spot)
+            mark(pile, p["page_id"], spot=spot, spots=spots)
             stats[got["verdict"]] += 1
         return
+    if b.level in ("tiles", "strong"):
+        old = pile.result(p["page_id"]) or {}
+        why = None if old.get("no_image") else accept_escalation(p, result_body(pile, p["page_id"]), got)
+        if why:
+            from .util import atomic_write_text
+
+            atomic_write_text(pile.results_dir / f"{p['page_id']}.rejected-{b.level}.md",
+                              parse.render_result_md(p, got, b.model, b.level))
+            rej = list(old.get("rejected") or []) + [{"level": b.level, "model": b.model, "why": why, "at": now_iso()}]
+            mark(pile, p["page_id"], status="needs-main", rejected=rej, failed_level=b.level,
+                 review_reason=f"{why}; the earlier reading was kept, the rejected one is in "
+                               f"{p['page_id']}.rejected-{b.level}.md")
+            stats["rejected"] += 1
+            return
     meta = save_result(pile, p, got, model=b.model, level=b.level, stage=b.stage)
+    if got.get("no_image"):
+        mark(pile, p["page_id"], no_image=True)
     if meta.get("escalate"):
         stats["flagged"] += 1
 
@@ -470,8 +567,19 @@ def stage_bulk(ctx: RunContext, pages: List[dict], stage: str = "bulk") -> dict:
     return execute(ctx, bs, "transcribe")
 
 
+def ladder(cfg: dict) -> List[str]:
+    """Levels a flagged page climbs after bulk, ending with the main model.
+
+    Default: straight to the stronger model. The cheap model at higher
+    resolution ("tiles") resolved few handwritten pages in practice and cost a
+    lot, so it is opt-in (escalation_ladder: ["tiles", "strong"])."""
+    lad = [x for x in (cfg.get("escalation_ladder") or ["strong"]) if x in ("tiles", "strong")]
+    return lad or ["strong"]
+
+
 def escalation_candidates(pile: Pile, pages: List[dict]) -> Dict[str, List[dict]]:
     res = pile.results()
+    steps = ["bulk"] + ladder(pile.cfg) + ["main"]
     out: Dict[str, List[dict]] = {"tiles": [], "strong": [], "main": []}
     for p in pages:
         r = res.get(p["page_id"])
@@ -480,12 +588,13 @@ def escalation_candidates(pile: Pile, pages: List[dict]) -> Dict[str, List[dict]
         if r.get("status") not in ("done", "failed") or not r.get("escalate"):
             continue
         lvl = r.get("failed_level") or r.get("level")
-        if lvl == "bulk":
-            out["tiles"].append(p)
-        elif lvl == "tiles":
-            out["strong"].append(p)
-        elif lvl == "strong":
-            out["main"].append(p)
+        if lvl == "tiles" and lvl not in steps:
+            lvl = "bulk"  # read at tiles by an earlier version or a manual rerun
+        if lvl not in steps:
+            continue
+        nxt = steps[steps.index(lvl) + 1] if steps.index(lvl) + 1 < len(steps) else None
+        if nxt in out:
+            out[nxt].append(p)
     return out
 
 
@@ -516,76 +625,139 @@ def stage_escalate(ctx: RunContext, pages: List[dict]) -> dict:
 
 
 def stage_spotcheck(ctx: RunContext, pages: List[dict], seed: Optional[str] = None) -> dict:
+    """Audit a random sample of every reading level against the page images.
+
+    Each level is sampled on its own, so the mismatch rate says which level is
+    weak instead of mixing them into one pile-wide figure."""
     cfg = ctx.cfg
     res = ctx.pile.results()
-    eligible = []
+    by_level: Dict[str, List[tuple]] = {}
     for p in pages:
         r = res.get(p["page_id"])
         if not r or r.get("status") != "done" or p["cls"] not in VISION_CLASSES or r.get("kind") == "blank":
             continue
-        if r.get("level") not in ("bulk", "tiles"):
+        if r.get("level") not in ("bulk", "tiles", "strong") or r.get("no_image"):
             continue
-        eligible.append((p, r))
-    if not eligible:
+        by_level.setdefault(r["level"], []).append((p, r))
+    if not by_level:
         return {}
-    already = [p for p, r in eligible if r.get("spot")]
     rng = random.Random(sha256_text(seed or ctx.pile.id))
-    want = max(int(cfg["spotcheck_min"]), int(round(len(eligible) * float(cfg["spotcheck_fraction"]))))
-    want = min(want, len(eligible))
-    pick = [p for p, r in eligible if not r.get("spot") and r.get("level") == "tiles"]
-    pool = [p for p, r in eligible if not r.get("spot") and r.get("level") == "bulk"]
-    rng.shuffle(pool)
-    need_random = max(0, want - len(already))
-    pick += pool[:need_random]
+    mn = int(cfg["spotcheck_min"])
+    frac = float(cfg["spotcheck_fraction"])
+    pick: List[dict] = []
+    checked_before = 0
+    for _lvl, items in sorted(by_level.items()):
+        done_here = sum(1 for _p, r in items if _was_checked_at(r, r.get("level")))
+        checked_before += done_here
+        want = min(len(items), max(mn, int(round(len(items) * frac))))
+        pool = [p for p, r in items if not _was_checked_at(r, r.get("level"))]
+        rng.shuffle(pool)
+        pick += pool[:max(0, want - done_here)]
     if not pick:
-        return {"checked_before": len(already)}
+        return {"checked_before": checked_before}
+    order = {p["page_id"]: i for i, p in enumerate(pages)}
+    pick.sort(key=lambda p: order[p["page_id"]])
     bs = make_batches(pick, mode="spotcheck", level="check", model=cfg["models"]["check"], stage="spotcheck", size=3)
     st = execute(ctx, bs, "spotcheck")
     st["sampled"] = len(pick)
     return st
 
 
+def _was_checked_at(r: dict, level: Optional[str]) -> bool:
+    if any(s.get("level") == level for s in r.get("spots") or []):
+        return True
+    return bool(r.get("spot")) and not r.get("spots")
+
+
 def spot_summary(pile: Pile) -> dict:
+    """Spot-check results per reading level, from the full history: later fixes
+    don't erase the original verdicts, they are counted separately."""
     res = pile.results()
-    verdicts = Counter()
+    per: Dict[str, Counter] = {}
+    corrected = 0
     for r in res.values():
-        s = r.get("spot")
-        if s and s.get("verdict") in ("match", "minor", "mismatch"):
-            verdicts[s["verdict"]] += 1
-    n = sum(verdicts.values())
-    rate = verdicts["mismatch"] / n if n else None
+        hist = list(r.get("spots") or [])
+        if not hist and r.get("spot"):
+            hist = [dict(r["spot"], level=r.get("level"))]
+        for s in hist:
+            if s.get("verdict") in ("match", "minor", "mismatch"):
+                per.setdefault(s.get("level") or "?", Counter())[s["verdict"]] += 1
+        if any(s.get("verdict") == "mismatch" for s in hist) and (r.get("fixed_by_main") or r.get("reviewed")):
+            corrected += 1
+    total = Counter()
+    for c in per.values():
+        total.update(c)
+    n = sum(total.values())
+    rate = total["mismatch"] / n if n else None
+    levels = {}
+    for lvl, c in per.items():
+        k = sum(c.values())
+        levels[lvl] = {"checked": k, "verdicts": dict(c), "mismatch_rate": (c["mismatch"] / k) if k else None}
     advice = None
-    if n >= 5 and rate is not None and rate > 0.15:
-        advice = (f"{rate:.0%} of spot-checked pages had meaning-changing errors. Consider re-reading the vision "
-                  "pages at a higher level: `pd.py rerun <pile> --level tiles` (cheap model, higher resolution) "
-                  "or `--level strong` (stronger model).")
-    return {"checked": n, "verdicts": dict(verdicts), "mismatch_rate": rate, "advice": advice}
+    weak = [(lvl, v) for lvl, v in levels.items() if v["checked"] >= 3 and (v["mismatch_rate"] or 0) > 0.15]
+    if weak:
+        lvl, v = max(weak, key=lambda x: x[1]["mismatch_rate"])
+        if lvl in ("bulk", "tiles"):
+            advice = (f"{v['mismatch_rate']:.0%} of spot-checked {lvl}-level pages had meaning-changing errors. "
+                      "Consider re-reading them with the stronger model: `pd.py rerun <pile> --level strong` "
+                      "(add `--doc <file>` to limit it to the documents with the most mismatches; `--dry-run` "
+                      "shows the cost first).")
+        else:
+            advice = (f"{v['mismatch_rate']:.0%} of spot-checked {lvl}-level pages had meaning-changing errors. "
+                      "There is no higher automatic level: review those documents' flagged pages against their "
+                      "images (`pd.py review <pile>`), and recompute numbers rather than trusting the transcription.")
+    return {"checked": n, "verdicts": dict(total), "mismatch_rate": rate, "levels": levels,
+            "corrected_since": corrected, "advice": advice}
+
+
+def pilot_size(pages: List[dict], n: int) -> int:
+    per_doc = Counter(p["doc_id"] for p in pages if p["cls"] in VISION_CLASSES)
+    heavy = sum(1 for v in per_doc.values() if v >= 4)
+    return min(30, max(n, 2 * heavy))
 
 
 def select_pilot(pile: Pile, pages: List[dict], n: int) -> List[dict]:
+    """A sample that represents every kind of document in the pile.
+
+    Every document with at least 4 vision pages contributes 2 pages spread over
+    it (so a handwritten notebook can't be missed), plus the hardest-looking
+    pages pile-wide, then a random fill per class."""
     res = pile.results()
     cands = [p for p in pages if p["cls"] in VISION_CLASSES and p["page_id"] not in res]
     if not cands:
         return []
+    n = pilot_size(pages, n)
     rng = random.Random(sha256_text(pile.id + "pilot"))
-    hard = sorted(cands, key=lambda p: (p.get("source_ppi") or 9999, p.get("text_quality", 0)))
     picked: List[dict] = []
     seen = set()
-    for p in hard[: max(1, n // 4)]:
-        picked.append(p)
-        seen.add(p["page_id"])
+
+    def take(p):
+        if p["page_id"] not in seen and len(picked) < n:
+            picked.append(p)
+            seen.add(p["page_id"])
+
+    by_doc: Dict[str, List[dict]] = {}
+    for p in cands:
+        by_doc.setdefault(p["doc_id"], []).append(p)
+    for group in by_doc.values():
+        if len(group) >= 4:
+            take(group[len(group) // 3])
+            take(group[(2 * len(group)) // 3])
+    hard = sorted(cands, key=lambda p: (p.get("source_ppi") or 9999, -(p.get("ink") or 0)))
+    for p in hard[: max(1, n // 5)]:
+        take(p)
     by_cls: Dict[str, List[dict]] = {}
     for p in cands:
         by_cls.setdefault(p["cls"], []).append(p)
-    for _cls, group in by_cls.items():
+    for _cls, group in sorted(by_cls.items()):
+        group = list(group)
         rng.shuffle(group)
-        for p in group[: max(1, n // (2 * len(by_cls)))]:
-            if p["page_id"] not in seen and len(picked) < n:
-                picked.append(p)
-                seen.add(p["page_id"])
+        for p in group[: max(1, n // (3 * len(by_cls)))]:
+            take(p)
     rest = [p for p in cands if p["page_id"] not in seen]
     rng.shuffle(rest)
-    picked += rest[: max(0, n - len(picked))]
+    for p in rest:
+        take(p)
     order = {p["page_id"]: i for i, p in enumerate(pages)}
     return sorted(picked, key=lambda p: order[p["page_id"]])
 
@@ -623,17 +795,19 @@ def review_queue(pile: Pile, pages: Optional[List[dict]] = None) -> dict:
                            "result": str(pile.results_dir / f"{pid}.md"),
                            "suggested": str(pile.results_dir / f"{pid}.suggested.md")
                            if (pile.results_dir / f"{pid}.suggested.md").exists() else None})
-        for f in (r.get("flags") or []) + (r.get("markers") or []):
+        cl = parse.claims(r)
+        shaky = r.get("confidence") == "low" or any(c["kind"] in ("illegible", "unsure") for c in cl)
+        for f in cl:
             if f.get("kind") == "source-suspect" and not r.get("verified"):
                 suspects.append({"page_id": pid, "relpath": r.get("relpath"), "page": r.get("index"),
-                                 "note": f.get("note", "")})
+                                 "note": f.get("note", ""), "misread_risk": shaky})
     key = {p: i for i, p in enumerate(order)}
     review.sort(key=lambda x: key.get(x["page_id"], 0))
     suspects.sort(key=lambda x: key.get(x["page_id"], 0))
     return {"review": review, "source_suspect": suspects}
 
 
-def rerun(ctx: RunContext, pages: List[dict], level: str, doc: Optional[str] = None) -> dict:
+def rerun(ctx: RunContext, pages: List[dict], level: str, doc: Optional[str] = None, dry_run: bool = False) -> dict:
     cfg = ctx.cfg
     res = ctx.pile.results()
     target = LEVEL_ORDER.index(level)
@@ -653,6 +827,8 @@ def rerun(ctx: RunContext, pages: List[dict], level: str, doc: Optional[str] = N
     model = cfg["models"]["bulk"] if level == "tiles" else cfg["models"]["escalate"]
     bs = make_batches(sel, mode="transcribe", level=level, model=model, stage="rerun",
                       size=max(1, int(cfg["batch_pages"]) // 2))
+    if dry_run:
+        return {"selected": len(sel), "estimated_tokens": sum(b.est_tokens(cfg) + 1500 * len(b.pages) for b in bs)}
     st = execute(ctx, bs, "rerun")
     st["selected"] = len(sel)
     return st

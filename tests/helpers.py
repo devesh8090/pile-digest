@@ -26,6 +26,7 @@ class TempEnv(unittest.TestCase):
         os.environ["FAKE_CLAUDE_LOG"] = str(self.tmp / "calls.log")
         os.environ.pop("FAKE_CLAUDE_BEHAVIOUR", None)
         os.environ.pop("FAKE_CLAUDE_UTIL", None)
+        os.environ.pop("FAKE_CLAUDE_EXTRA_TOKENS", None)
 
     def tearDown(self):
         os.environ.clear()

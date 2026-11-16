@@ -26,7 +26,7 @@ from pdlib import (config, converters, digest, engine, estimate, ledger, registr
 from pdlib.pile import Pile, all_prompts, open_pile, wait_note  # noqa: E402
 from pdlib.util import PileDigestError, human_bytes, human_tokens, now_iso, read_json, run, which, write_json  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 SKILL_DIR = Path(__file__).resolve().parents[1]
 JSON = False
 
@@ -228,8 +228,11 @@ def cmd_prepare(a) -> int:
 
 def _estimate(p: Pile) -> dict:
     pages = p.pages()
-    done = set(p.results().keys())
-    return estimate.estimate(pages, p.cfg, prompts=all_prompts(), ledger_path=p.ledger_path, done_ids=done)
+    res = p.results()
+    done = set(res.keys())
+    pilot_ids = (p.state().get("pilot") or {}).get("pages") or []
+    return estimate.estimate(pages, p.cfg, prompts=all_prompts(), ledger_path=p.ledger_path, done_ids=done,
+                             results=res, pilot_ids=pilot_ids)
 
 
 def cmd_estimate(a) -> int:
@@ -262,15 +265,19 @@ def cmd_pilot(a) -> int:
     est = _estimate(p)
     res = p.results()
     samples = []
+    unfinished = 0
     for pid in stats.get("pilot_pages", []):
-        r = res.get(pid) or {}
+        r = res.get(pid)
+        if not r or r.get("status") == "failed":
+            unfinished += 1
+            continue
         samples.append({"page_id": pid, "relpath": r.get("relpath"), "page": r.get("index"), "level": r.get("level"),
                         "confidence": r.get("confidence"), "escalate": r.get("escalate"),
                         "flags": len(r.get("flags") or []) + len(r.get("markers") or []),
                         "file": str(p.results_dir / f"{pid}.md")})
     p.set_state(pilot={"at": now_iso(), "pages": stats.get("pilot_pages", []), "stopped": ctx.stop_reason})
     if JSON:
-        out({"stats": stats, "samples": samples, "estimate": est, "stopped": ctx.stop_reason,
+        out({"stats": stats, "samples": samples, "unfinished": unfinished, "estimate": est, "stopped": ctx.stop_reason,
              "stop_detail": ctx.stop_detail})
         return 0
     print(_run_summary(ctx, {k: v for k, v in stats.items() if k != "pilot_pages"}))
@@ -278,6 +285,8 @@ def cmd_pilot(a) -> int:
     for s in samples:
         flag = f" ⚑ {s['escalate']}" if s["escalate"] else ""
         print(f"  {s['relpath']} p{s['page']} [{s['confidence']}]{flag}\n    {s['file']}")
+    if unfinished:
+        print(f"  ({unfinished} sampled page(s) not finished; the run picks them up)")
     print()
     print(estimate.format_estimate(est))
     print("\nIf the user agrees, record it with: pd.py approve " + p.id)
@@ -286,12 +295,27 @@ def cmd_pilot(a) -> int:
 
 def cmd_approve(a) -> int:
     p = open_pile(a.pile)
+    if a.add is not None:
+        appr = p.state().get("approved")
+        if not appr:
+            raise PileDigestError("nothing approved yet; run pd.py approve without --add first")
+        appr["total_tokens"] = int(appr.get("total_tokens") or (appr.get("bulk_tokens", 0) + appr.get("strong_tokens", 0)))
+        appr["total_tokens"] += int(a.add)
+        appr.setdefault("additions", []).append({"at": now_iso(), "tokens": int(a.add), "note": a.note or ""})
+        p.set_state(approved=appr)
+        out(appr, f"Approved ~{human_tokens(int(a.add))} more; ~{human_tokens(appr['total_tokens'])} in total since "
+                  f"{appr['at']}.")
+        return 0
     est = _estimate(p)
-    appr = {"at": now_iso(), "bulk_tokens": est["tokens"]["bulk_model"], "strong_tokens": est["tokens"]["strong_model"],
+    appr = {"at": now_iso(), "ledger_rows": ledger.row_count(p.ledger_path),
+            "bulk_tokens": est["tokens"]["bulk_model"], "strong_tokens": est["tokens"]["strong_model"],
+            "total_tokens": est["tokens"]["bulk_model"] + est["tokens"]["strong_model"],
             "pages_todo": est["pages"]["vision"] + est["pages"]["text_summaries"], "note": a.note or ""}
     p.set_state(approved=appr)
+    f = float(p.cfg.get("run_overrun_factor", 1.25))
     out(appr, f"Approved: ~{human_tokens(appr['bulk_tokens'])} cheap-model tokens and "
-              f"~{human_tokens(appr['strong_tokens'])} stronger-model tokens for {appr['pages_todo']} pages.")
+              f"~{human_tokens(appr['strong_tokens'])} stronger-model tokens for {appr['pages_todo']} pages. "
+              f"Runs stop and ask again if spend passes ~{human_tokens(int(appr['total_tokens'] * f))}.")
     return 0
 
 
@@ -304,11 +328,13 @@ def _check_approval(p: Pile) -> None:
     if not appr:
         raise PileDigestError("this pile's estimate has not been approved yet. Show the estimate to the user "
                               f"(pd.py estimate {p.id}); if they agree, run pd.py approve {p.id}")
-    allowed = (appr.get("bulk_tokens", 0) + appr.get("strong_tokens", 0)) * 1.3 + 20000
+    total = int(appr.get("total_tokens") or (appr.get("bulk_tokens", 0) + appr.get("strong_tokens", 0)))
+    left = max(0, total - ledger.spent_since(p.ledger_path, appr))
+    allowed = left * float(p.cfg.get("run_overrun_factor", 1.25)) + 20000
     if todo > allowed:
-        raise PileDigestError(f"the remaining work (~{human_tokens(todo)} tokens) is more than was approved "
-                              f"(~{human_tokens(allowed / 1.3)}), probably because files were added. Show the new "
-                              f"estimate to the user and re-approve: pd.py approve {p.id}")
+        raise PileDigestError(f"the remaining work (~{human_tokens(todo)} tokens) is more than what is left of the "
+                              f"approval (~{human_tokens(left)}), e.g. because files were added or pages escalated "
+                              f"more than expected. Show the new estimate to the user and re-approve: pd.py approve {p.id}")
 
 
 STAGES = ["summaries", "bulk", "escalate", "spotcheck", "digest"]
@@ -324,7 +350,7 @@ def cmd_run(a) -> int:
         if a.prepare or not p.index().get("docs"):
             p.prepare(progress)
         _check_approval(p)
-        ctx = engine.RunContext(p, budget=a.budget)
+        ctx = engine.RunContext(p, budget=a.budget, approval_cap=True)
         all_stats: dict = {}
         for s in stages:
             if ctx.stop_reason:
@@ -366,10 +392,10 @@ def cmd_run(a) -> int:
         out(res)
         return 0
     print(_run_summary(ctx, all_stats))
+    if ctx.stop_reason == "approval":
+        print("ASK THE USER before continuing: the approved amount is used up.")
     if spot["checked"]:
-        mr = spot["mismatch_rate"]
-        print(f"Spot checks: {spot['checked']} pages, verdicts {spot['verdicts']}" +
-              (f", mismatch rate {mr:.0%}" if mr is not None else ""))
+        print(_spot_line(spot))
         if spot["advice"]:
             print("ADVICE: " + spot["advice"].replace("<pile>", p.id))
     print(f"For main-model review: {len(q['review'])} pages; source claims to verify: {len(q['source_suspect'])}")
@@ -378,12 +404,32 @@ def cmd_run(a) -> int:
     return 0
 
 
+def _spot_line(spot: dict) -> str:
+    parts = []
+    for lvl, v in sorted(spot.get("levels", {}).items()):
+        mr = v.get("mismatch_rate")
+        parts.append(f"{lvl} {v['checked']} checked" + (f", {mr:.0%} mismatch" if mr is not None else ""))
+    line = "spot checks: " + ("; ".join(parts) or str(spot.get("verdicts")))
+    if spot.get("corrected_since"):
+        line += f" ({spot['corrected_since']} mismatched page(s) corrected since)"
+    return line
+
+
 def cmd_rerun(a) -> int:
     p = open_pile(a.pile)
-    with p.lock():
+    if a.dry_run:
         ctx = engine.RunContext(p, budget=a.budget)
+        st = engine.rerun(ctx, p.pages(), a.level, a.doc, dry_run=True)
+        out(st, f"Would re-read {st['selected']} page(s) at level {a.level}: ~{human_tokens(st.get('estimated_tokens', 0))} "
+                f"tokens. If the user agrees: pd.py approve {p.id} --add <tokens>, then run this without --dry-run.")
+        return 0
+    if not p.state().get("approved"):
+        raise PileDigestError(f"nothing approved for this pile yet: show the cost (--dry-run), then pd.py approve {p.id}")
+    with p.lock():
+        ctx = engine.RunContext(p, budget=a.budget, approval_cap=True)
         st = engine.rerun(ctx, p.pages(), a.level, a.doc)
-    out({"stats": st, "stopped": ctx.stop_reason}, _run_summary(ctx, st))
+        digest.build(p, None, with_sections=False)
+    out({"stats": st, "stopped": ctx.stop_reason, "stop_detail": ctx.stop_detail}, _run_summary(ctx, st))
     return 0
 
 
@@ -404,7 +450,6 @@ def cmd_status(a) -> int:
     s["review"] = len(q["review"])
     s["source_suspect"] = len(q["source_suspect"])
     s["spotcheck"] = engine.spot_summary(p)
-    s["outputs"] = _outputs_status(p)
     if JSON:
         out(s)
         return 0
@@ -415,21 +460,23 @@ def cmd_status(a) -> int:
           f"; not read yet: {s['pages_without_result']}")
     if s["levels"]:
         print("  read at level: " + ", ".join(f"{k} {v}" for k, v in s["levels"].items()))
-    print(f"  spent so far: {human_tokens(sp['total_tokens'])} tokens in {sp['calls']} calls "
-          f"(API-price equivalent ${sp['cost_usd']:.2f})")
+    print(f"  spent so far: {human_tokens(sp['total_tokens'])} tokens (input + cache writes + output) in {sp['calls']} "
+          f"calls, plus {human_tokens(sp.get('cache_read_tokens', 0))} cache reads (API-price equivalent "
+          f"${sp['cost_usd']:.2f})")
+    appr = p.state().get("approved")
+    if appr:
+        tot = int(appr.get("total_tokens") or (appr.get("bulk_tokens", 0) + appr.get("strong_tokens", 0)))
+        print(f"  approved: ~{human_tokens(tot)} since {appr.get('at')}; spent since then "
+              f"~{human_tokens(ledger.spent_since(p.ledger_path, appr))}")
     lr = s.get("last_run") or {}
     if lr.get("stopped"):
         print(f"  last run stopped: {lr.get('stop_detail') or lr['stopped']} — re-run to resume")
     print(f"  review queue: {s['review']} pages; source claims to verify: {s['source_suspect']}")
     if s["spotcheck"]["checked"]:
-        print(f"  spot checks: {s['spotcheck']['verdicts']}")
-    for name, o in s["outputs"].items():
-        stale = o.get("stale_docs") or []
-        print(f"  output '{name}': built {o.get('built')}" + (f", STALE for {len(stale)} file(s)" if stale else ", up to date"))
+        print("  " + _spot_line(s["spotcheck"]))
     for d in s["unreadable"]:
         print(f"  not readable: {d['relpath']} — {d.get('note', '')}")
     print(f"  digest: {s['digest'] or 'not built yet'}")
-    print(f"  outputs folder: {s['output_dir']}")
     return 0
 
 
@@ -448,12 +495,14 @@ def cmd_review(a) -> int:
     if q["review"]:
         print("Pages the main model should read from the image (pd.py page <pile> <ref> --image):")
         for it in q["review"]:
-            sug = "  (a suggested correction exists: --suggested)" if it.get("suggested") else ""
+            sug = "  (a suggested correction exists: check it against the image before using --suggested)" \
+                if it.get("suggested") else ""
             print(f"  {it['ref']}  {it['relpath']} p{it['page']}: {it['reason']}{sug}")
     if q["source_suspect"]:
         print("Claims flagged as possibly wrong in the source (verify, then pd.py verify):")
         for it in q["source_suspect"]:
-            print(f"  {it['ref']}  {it['relpath']} p{it['page']}: {it['note']}")
+            risk = "  [check the image first: possibly a misread]" if it.get("misread_risk") else ""
+            print(f"  {it['ref']}  {it['relpath']} p{it['page']}: {it['note']}{risk}")
     return 0
 
 
@@ -514,8 +563,22 @@ def cmd_fix(a) -> int:
     parsed["markers"] = [{"kind": m.group(1).lower(), "note": (m.group(2) or "")} for m in MARKER_RE.finditer(content)]
     meta = engine.save_result(p, pg, parsed, model="main", level="main", stage="review", content=content)
     engine.mark(p, pg["page_id"], reviewed=True, fixed_by_main=True, fix_note=a.note or "")
-    out(meta, f"Saved the main-model version of {a.ref}.")
+    _refresh_digest(p)
+    msg = f"Saved the main-model version of {a.ref}."
+    if a.suggested:
+        msg += (" Reminder: a suggested correction comes from a cheaper model and can itself be wrong; it should have "
+                "been checked against the page image first.")
+    out(meta, msg)
     return 0
+
+
+def _refresh_digest(p: Pile) -> None:
+    """Rebuild the digest for free (no model calls), so it shows fixes and verdicts."""
+    try:
+        if p.digest_path.exists():
+            digest.build(p, None, with_sections=True)
+    except Exception as exc:  # noqa: BLE001 - a digest refresh must never break a review step
+        progress(f"note: digest not refreshed ({exc})")
 
 
 def cmd_reclass(a) -> int:
@@ -529,6 +592,7 @@ def cmd_reclass(a) -> int:
         old = p.result(pg["page_id"]) or {}
         if old.get("level") not in ("main",):
             res.unlink()  # re-read on the next run
+    _refresh_digest(p)
     out({"page_id": pg["page_id"], "cls": a.cls},
         f"{a.ref} is now '{a.cls}'. It is read on the next `pd.py run` (approval may be needed).")
     return 0
@@ -541,6 +605,7 @@ def cmd_accept(a) -> int:
     if not r:
         raise PileDigestError("this page has no result to accept")
     engine.mark(p, pg["page_id"], reviewed=True, status="done", review_note=a.note or "accepted as is")
+    _refresh_digest(p)
     out({"ok": True}, f"Marked {a.ref} as reviewed.")
     return 0
 
@@ -552,6 +617,7 @@ def cmd_verify(a) -> int:
     ver = r.get("verifications") or []
     ver.append({"verdict": a.verdict, "note": a.note, "at": now_iso()})
     engine.mark(p, pg["page_id"], verified=True, verifications=ver)
+    _refresh_digest(p)
     out({"ok": True}, f"Recorded: {a.ref} is {a.verdict}.")
     return 0
 
@@ -581,99 +647,23 @@ def cmd_errata(a) -> int:
 
 
 def cmd_digest(a) -> int:
+    """Free by default: rebuilds from stored results and cached section summaries.
+    --sections also (re)writes section summaries with the stronger model."""
     p = open_pile(a.pile)
     with p.lock():
-        ctx = engine.RunContext(p, budget=a.budget) if not a.no_sections else None
-        if ctx is not None:
-            appr = p.state().get("approved")
-            if not appr:
-                ctx = None  # section digests call a model: only after approval
-        path = digest.build(p, ctx, with_sections=ctx is not None)
-    out({"digest": str(path)}, f"Digest: {path}")
+        ctx = None
+        if a.sections:
+            if not p.state().get("approved"):
+                raise PileDigestError("section summaries call a model: get the user's go-ahead, then pd.py approve "
+                                      f"{p.id} (or approve --add <tokens>)")
+            ctx = engine.RunContext(p, budget=a.budget, approval_cap=True)
+        path = digest.build(p, ctx, with_sections=True)
+    info = digest.info(p)
+    out({"digest": str(path), **info}, f"Digest: {path} (~{human_tokens(info['tokens'])} tokens)" +
+        (f"; pages per file in {info['pages_dir']}" if info.get("split") else "") +
+        (f"; {info['stale_sections']} section summaries predate later changes (refresh with --sections)"
+         if info.get("stale_sections") else ""))
     return 0
-
-
-# ------------------------------------------------------------------ outputs
-
-
-def profiles() -> dict:
-    out_ = {}
-    for f in sorted((SKILL_DIR / "profiles").glob("*.md")):
-        out_[f.stem] = {"instructions": str(f), "builtin": True}
-    for name, spec in (config.load().get("profiles") or {}).items():
-        if not isinstance(spec, dict):
-            continue
-        item = dict(out_.get(name, {}))
-        item.update({k: v for k, v in spec.items()})
-        if item.get("instructions"):
-            item["instructions"] = os.path.expanduser(item["instructions"])
-        item["builtin"] = name in out_ and not spec.get("instructions")
-        out_[name] = item
-    return out_
-
-
-def _outputs_status(p: Pile) -> dict:
-    data = read_json(p.dir / "outputs.json", {}) or {}
-    fps = digest.doc_fingerprints(p)
-    res = {}
-    for name, o in data.items():
-        old = o.get("fingerprints", {})
-        stale = [d for d, h in fps.items() if old.get(d) != h]
-        res[name] = {"built": o.get("built"), "dir": o.get("dir"), "stale_docs": stale}
-    return res
-
-
-def cmd_profiles(a) -> int:
-    pr = profiles()
-    out(pr, "\n".join(f"- {k}: {v.get('instructions')}" + (f"  post_build: {v['post_build']}" if v.get("post_build") else "")
-                      for k, v in pr.items()))
-    return 0
-
-
-def cmd_outputs(a) -> int:
-    p = open_pile(a.pile)
-    if a.mark:
-        data = read_json(p.dir / "outputs.json", {}) or {}
-        data[a.mark] = {"built": now_iso(), "dir": str(p.output_dir() / a.mark),
-                        "fingerprints": digest.doc_fingerprints(p)}
-        write_json(p.dir / "outputs.json", data)
-        out(data[a.mark], f"Recorded output '{a.mark}' as built from the current digest.")
-        return 0
-    st = _outputs_status(p)
-    labels = digest.doc_labels(p)
-    idx = {d["doc_id"]: d["relpath"] for d in p.index().get("docs", [])}
-    if JSON:
-        out({"output_dir": str(p.output_dir()), "outputs": st})
-        return 0
-    print(f"Outputs folder: {p.output_dir()}")
-    if not st:
-        print("No outputs recorded yet.")
-    for name, o in st.items():
-        print(f"- {name}: built {o['built']}")
-        for d in o["stale_docs"]:
-            print(f"    stale: {labels.get(d, '?')} {idx.get(d, d)}")
-    return 0
-
-
-def cmd_postbuild(a) -> int:
-    p = open_pile(a.pile)
-    pr = profiles().get(a.profile)
-    if not pr:
-        raise PileDigestError(f"unknown profile '{a.profile}'")
-    cmd = pr.get("post_build")
-    if not cmd:
-        out({"ran": False}, f"Profile '{a.profile}' has no post_build command.")
-        return 0
-    if isinstance(cmd, str):
-        raise PileDigestError("post_build must be a list of arguments, e.g. [\"make\", \"pdf\"] (never a shell string)")
-    outdir = p.output_dir() / a.profile
-    if not outdir.is_dir():
-        raise PileDigestError(f"{outdir} does not exist yet; write the outputs first")
-    args = [os.path.expanduser(str(c)).replace("{out}", str(outdir)).replace("{pile}", str(p.root)) for c in cmd]
-    r = run(args, cwd=outdir, timeout=3600)
-    res = {"ran": True, "cmd": args, "returncode": r.returncode, "stdout": r.out()[-4000:], "stderr": r.err()[-4000:]}
-    out(res, f"$ {' '.join(args)}\nexit {r.returncode}\n{r.out()[-3000:]}\n{r.err()[-3000:]}")
-    return 0 if r.ok else 1
 
 
 # ------------------------------------------------------------------ misc
@@ -797,6 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("approve", cmd_approve, "record that the user approved the current estimate")
     s.add_argument("pile")
     s.add_argument("--note")
+    s.add_argument("--add", type=int, metavar="TOKENS", help="approve this many more tokens on top of the approval")
     s = add("run", cmd_run, "run the approved pipeline; resumable (MODEL CALLS)")
     s.add_argument("pile")
     s.add_argument("--stages", help=f"comma list from {STAGES}")
@@ -808,7 +799,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--level", choices=["tiles", "strong"], required=True)
     s.add_argument("--doc", help="limit to one document (relpath or doc id)")
     s.add_argument("--budget", type=int)
-    s = add("status", cmd_status, "show progress, spend, review queue and output staleness")
+    s.add_argument("--dry-run", action="store_true", help="only show how many pages and tokens")
+    s = add("status", cmd_status, "show progress, spend and the review queue")
     s.add_argument("pile", nargs="?")
     s = add("review", cmd_review, "list pages and claims waiting for the main model")
     s.add_argument("pile")
@@ -842,17 +834,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--note", required=True)
     s = add("errata", cmd_errata, "list verified source errors and corrected transcriptions")
     s.add_argument("pile")
-    s = add("digest", cmd_digest, "rebuild the digest (section digests only if approved)")
+    s = add("digest", cmd_digest, "rebuild the digest for free; --sections also refreshes section summaries (MODEL CALLS)")
     s.add_argument("pile")
-    s.add_argument("--no-sections", action="store_true")
+    s.add_argument("--sections", action="store_true")
     s.add_argument("--budget", type=int)
-    add("profiles", cmd_profiles, "list output profiles")
-    s = add("outputs", cmd_outputs, "show outputs and which are stale; --mark records a build")
-    s.add_argument("pile")
-    s.add_argument("--mark", metavar="PROFILE")
-    s = add("postbuild", cmd_postbuild, "run a profile's post_build command in its output folder")
-    s.add_argument("pile")
-    s.add_argument("profile")
     s = add("unlock", cmd_unlock, "type the password for a protected PDF (run in your own terminal)")
     s.add_argument("pile")
     s.add_argument("relpath")

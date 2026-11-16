@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config, inventory, registry
-from .util import PileDigestError, read_json
+from .util import DERIVED_DIRNAME, PileDigestError, read_json
 
 DOC_EXTS = {
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".tif", ".tiff", ".bmp", ".heic", ".heif", ".avif", ".jp2",
@@ -83,8 +83,7 @@ def scan(path: Optional[str] = None, *, cwd: Optional[str] = None, register_path
             continue
         loose = False
         for c in children:
-            if c.name.startswith(".") or c.name.lower() in (cfg.get("output_dirname", "pile-digest"),
-                                                            cfg.get("output_dirname", "pile-digest") + "-loose"):
+            if c.name.startswith(".") or c.name.lower() in (DERIVED_DIRNAME, DERIVED_DIRNAME + "-loose"):
                 continue
             if c.is_dir() and not c.is_symlink():
                 if _inside_known(c, data["piles"]) or registry.find(str(c), data):

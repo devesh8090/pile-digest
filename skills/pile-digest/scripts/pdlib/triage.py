@@ -17,11 +17,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from . import raster
-from .textutil import math_density, normalize_for_compare, quality
+import re
+
+from .textutil import content_tokens, math_density, normalize_page_text, quality
 from .util import sha256_bytes, sha256_text
 
 SKIP_CLASSES = {"blank", "duplicate", "repeated-title"}
 FREE_CLASSES = {"title", "text-ok"}
+CLOSING_RE = re.compile(r"^\W*(thank\s*you|thanks|any\s+questions|questions|q\s*&\s*a|the\s+end|end)\W*$", re.I)
 VISION_CLASSES = {"hybrid", "vision"}
 
 
@@ -93,7 +96,9 @@ def triage_doc(doc: dict, cfg: dict, tmp: Path) -> List[dict]:
                 rec["w_px"], rec["h_px"] = g.w * 10, g.h * 10
         if u.get("render") and u["render"]["type"] == "pdf" and u["render"]["page"] in nontext:
             rec["nontext_ink"] = raster.stats(nontext[u["render"]["page"]])["ink"]
-        rec["text_sha"] = sha256_text(normalize_for_compare(text))[:24] if text.strip() else None
+        rec["text_sha"] = sha256_text(normalize_page_text(text))[:24] if text.strip() else None
+        if i > len(units) - 2 and len(units) > 2 and rec["chars"] <= 40 and CLOSING_RE.match(normalize_page_text(text)):
+            rec["closing"] = True
         rec["cls"], rec["why"] = classify(rec, cfg)
         w, h = page_dims(rec)
         if w and h and h / w > float(cfg.get("tall_page_ratio", 2.2)):
@@ -117,6 +122,8 @@ def classify(rec: dict, cfg: dict):
     chars = rec["chars"]
     if not rec.get("render"):
         return ("text-ok", "text file") if text else ("blank", "empty text")
+    if rec.get("closing"):
+        return "title", "closing slide"
     ink = rec.get("ink")
     if ink is not None:
         tiny_text = chars <= 3 or (chars <= 6 and text.replace(" ", "").isdigit())
@@ -155,14 +162,23 @@ def cross_page(pages: List[dict], cfg: dict, tmp: Path) -> None:
     by_raster: Dict[str, str] = {}
     by_text: Dict[str, str] = {}
     hashes: List[dict] = []
+    _mark_builds(pages)
     for p in pages:
-        if p.get("cls") == "blank" or p.get("pinned"):
+        if p.get("cls") == "blank":
+            continue
+        if p.get("pinned") == "hand":
+            # A class set by hand stays, but the page still counts as the original
+            # of later copies, so duplicate decisions don't change between runs.
+            _register(p, by_raster, by_text, hashes)
             continue
         p.pop("dup_of", None)
         if p["cls"] in ("duplicate", "repeated-title", "title"):
             p["cls"], p["why"] = classify(p, cfg)
         # Exact duplicate: identical low-res raster and identical text.
         key = None
+        if p.get("build"):
+            _register(p, by_raster, by_text, hashes)
+            continue
         if p.get("raster_sha"):
             key = p["raster_sha"] + ":" + (p.get("text_sha") or "")
             if key in by_raster:
@@ -179,8 +195,8 @@ def cross_page(pages: List[dict], cfg: dict, tmp: Path) -> None:
                     continue
                 if (p.get("lr_w"), p.get("lr_h")) != (q.get("lr_w"), q.get("lr_h")):
                     continue
-                if (p.get("text_sha") or "") != (q.get("text_sha") or "") and p["chars"] > 20:
-                    continue
+                if (p.get("text_sha") or "") != (q.get("text_sha") or ""):
+                    continue  # different text (page numbers aside) is different content, however small
                 ga = _lowres_for_unit(p, cfg, tmp, cache)
                 gb = _lowres_for_unit(q, cfg, tmp, cache)
                 if ga is None or gb is None:
@@ -199,9 +215,9 @@ def cross_page(pages: List[dict], cfg: dict, tmp: Path) -> None:
     # Repeated short title pages.
     groups: Dict[str, List[dict]] = defaultdict(list)
     for p in pages:
-        if p["cls"] in ("text-ok", "duplicate") and p.get("render") and 3 < p["chars"] < 160 \
-                and p.get("image_cov", 0) < 0.15 and (p.get("nontext_ink") or 0) < 0.015:
-            groups[normalize_for_compare(p["text"])].append(p)
+        if p["cls"] in ("text-ok", "duplicate") and p.get("render") and 3 < p["chars"] < 160 and not p.get("build") \
+                and p.get("image_cov", 0) < 0.15 and (p.get("nontext_ink") or 0) < 0.015 and not p.get("pinned"):
+            groups[normalize_page_text(p["text"])].append(p)
     for norm, group in groups.items():
         if len(group) >= 3 and norm:
             first = next((q for q in group if q["cls"] == "text-ok"), None)
@@ -211,6 +227,36 @@ def cross_page(pages: List[dict], cfg: dict, tmp: Path) -> None:
             for q in group:
                 if q is not first and q["cls"] == "text-ok":
                     q["cls"], q["dup_of"], q["why"] = "repeated-title", first["page_id"], "repeated title page"
+
+
+def _register(p: dict, by_raster: dict, by_text: dict, hashes: list) -> None:
+    if p.get("raster_sha"):
+        by_raster.setdefault(p["raster_sha"] + ":" + (p.get("text_sha") or ""), p["page_id"])
+    if p.get("text_sha") and p["chars"] >= 50:
+        by_text.setdefault(p["text_sha"], p["page_id"])
+    if p.get("dhash"):
+        hashes.append(p)
+
+
+def _mark_builds(pages: List[dict]) -> None:
+    """Progressive build-up slides: each page adds to the one before (a table
+    filled in step by step). They differ in content, so none is a repeat."""
+    for p in pages:
+        p.pop("build", None)
+    prev = None
+    for p in pages:
+        if prev is not None and prev["doc_id"] == p["doc_id"] and p["index"] == prev["index"] + 1:
+            a, b = prev.get("_tok"), None
+            if a is None:
+                a = prev["_tok"] = content_tokens(prev.get("text", ""))
+            b = p["_tok"] = content_tokens(p.get("text", ""))
+            if a and a < b:
+                prev["build"] = p["build"] = True
+        else:
+            p["_tok"] = content_tokens(p.get("text", ""))
+        prev = p
+    for p in pages:
+        p.pop("_tok", None)
 
 
 def counts(pages: List[dict]) -> dict:

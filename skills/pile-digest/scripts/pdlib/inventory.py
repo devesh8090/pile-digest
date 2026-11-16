@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Optional
 
 from . import sniff as sniffmod
-from .util import PileDigestError, run, safe_name, sha256_file, which
+from .util import DERIVED_DIRNAME, PileDigestError, run, safe_name, sha256_file, which
 
 JUNK_NAMES = {
     ".ds_store", "thumbs.db", "desktop.ini", "ehthumbs.db", ".localized", "icon\r", ".directory",
@@ -469,7 +469,7 @@ def build(root: Path, *, mode: str, cfg: dict, state: Path, previous: Optional[d
         e["status"] = "ok"
         files[rel] = e
 
-    for rel, path, st in walk(root, mode=mode, output_dirname=cfg.get("output_dirname", "pile-digest"),
+    for rel, path, st in walk(root, mode=mode, output_dirname=DERIVED_DIRNAME,
                               ignore=cfg.get("ignore", [])):
         add(rel, path, st, None, 0)
     return {"files": files}
@@ -479,7 +479,7 @@ def quick_diff(root: Path, *, mode: str, cfg: dict, previous: Optional[dict]) ->
     """Cheap change detection by size+mtime only (no hashing, no unpacking)."""
     prev = {k: v for k, v in ((previous or {}).get("files", {})).items() if v.get("parent") is None}
     now: dict = {}
-    for rel, _path, st in walk(root, mode=mode, output_dirname=cfg.get("output_dirname", "pile-digest"),
+    for rel, _path, st in walk(root, mode=mode, output_dirname=DERIVED_DIRNAME,
                               ignore=cfg.get("ignore", [])):
         now[rel] = (st.st_size, int(st.st_mtime)) if st else (None, None)
     new = sorted(set(now) - set(prev))

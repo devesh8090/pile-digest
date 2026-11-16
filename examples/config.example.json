@@ -4,10 +4,5 @@
   "batch_pages": 5,
   "concurrency": 3,
   "max_window_utilization": 0.9,
-  "budget_tokens": 2000000,
-  "profiles": {
-    "study-notes": {
-      "post_build": ["make", "-C", "{out}", "pdf"]
-    }
-  }
+  "budget_tokens": 2000000
 }

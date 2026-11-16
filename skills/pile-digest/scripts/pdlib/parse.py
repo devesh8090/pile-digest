@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+from .textutil import clip
+
 BLOCK_RE = re.compile(r"^=== PAGE (?P<id>[^\s=]+) ===[ \t]*$(?P<body>.*?)^=== END PAGE (?P=id) ===[ \t]*$",
                       re.M | re.S)
 FIELD_RE = re.compile(r"^(KIND|CONFIDENCE|SUMMARY|TOPICS|VERDICT):[ \t]*(.*)$", re.M)
@@ -47,8 +49,10 @@ def parse_flags(text: Optional[str]) -> List[dict]:
             continue
         kind, _, note = item.partition(":")
         kind = kind.strip().lower().replace(" ", "-")
-        if kind not in ("illegible", "unsure", "source-suspect", "figure", "cut-off", "low-resolution",
-                        "rotated", "language", "other", "difference"):
+        if kind in ("typos", "spelling", "spelling-error"):
+            kind = "typo"
+        if kind not in ("illegible", "unsure", "source-suspect", "typo", "figure", "cut-off", "low-resolution",
+                        "rotated", "language", "other", "difference", "garbled"):
             note = item
             kind = "other"
         flags.append({"kind": kind, "note": note.strip()[:400]})
@@ -102,7 +106,7 @@ def parse_blocks(text: str, expected_ids: List[str], *, mode: str = "transcribe"
         markers = []
         for mk in MARKER_RE.finditer(content):
             markers.append({"kind": mk.group(1).lower(), "note": (mk.group(2) or "").strip()[:200]})
-        p.update(kind=kind, confidence=conf, summary=summary[:600],
+        p.update(kind=kind, confidence=conf, summary=clip(summary, 900),
                  topics=[t.strip() for t in re.split(r"[;,]", fields.get("TOPICS", "")) if t.strip()][:12],
                  flags=flags, markers=markers, content=content)
         out[pid] = p
@@ -110,6 +114,53 @@ def parse_blocks(text: str, expected_ids: List[str], *, mode: str = "transcribe"
     if extra:
         problems.append(f"unexpected blocks: {sorted(extra)[:5]}")
     return out, problems
+
+
+NO_IMAGE_RE = re.compile(r"(image|picture|page|scan)s?\b[^.]{0,40}\b(did not|didn't|was not|wasn't|were not|not)\s+"
+                         r"(arrive|received|attached|included|provided|visible|shown|available)|no image (data|was|is|attached)"
+                         r"|only the (page )?label", re.I)
+
+
+def no_image_reply(p: dict) -> bool:
+    """The model says it got no image (it sometimes claims this on dark scans).
+    Treated as a failed call and retried at the same level, not escalated."""
+    text = " ".join([p.get("summary", "")] + [f.get("note", "") for f in p.get("flags", [])])
+    return bool(NO_IMAGE_RE.search(text)) and len((p.get("content") or "").strip()) < 200
+
+
+CLAIM_KINDS = ("source-suspect", "illegible", "unsure", "cut-off", "typo")
+
+
+def _norm_note(s: str) -> str:
+    return re.sub(r"[^\w]+", " ", (s or "").lower()).strip()
+
+
+def claims(r: dict) -> List[dict]:
+    """One list of a result's flags and inline markers, without the duplicates
+    that arise when a model both flags a problem and marks it inline."""
+    out: List[dict] = []
+    seen: List[Tuple[str, set]] = []
+    for f in list(r.get("flags") or []) + list(r.get("markers") or []):
+        kind = f.get("kind")
+        if not kind:
+            continue
+        note = (f.get("note") or "").strip()
+        words = set(_norm_note(note).split())
+        dup = False
+        for k, w in seen:
+            if k != kind:
+                continue
+            if not words and not w:
+                dup = True
+            elif words and w and len(words & w) / max(1, min(len(words), len(w))) >= 0.6:
+                dup = True
+            if dup:
+                break
+        if dup:
+            continue
+        seen.append((kind, words))
+        out.append({"kind": kind, "note": note})
+    return out
 
 
 def needs_escalation(p: dict) -> Optional[str]:
@@ -138,9 +189,7 @@ def render_result_md(page: dict, parsed: dict, model: str, level: str) -> str:
     ]
     if parsed.get("topics"):
         lines.append(f"**Topics:** {', '.join(parsed['topics'])}")
-    flags = list(parsed.get("flags", []))
-    flagged = {f["kind"] for f in flags}
-    flags += [m for m in parsed.get("markers", []) if m["kind"] not in flagged]
+    flags = claims(parsed)
     if flags:
         lines.append("**Flags:** " + "; ".join(f"{f['kind']}: {f['note']}" if f.get("note") else f["kind"] for f in flags))
     lines.append("")

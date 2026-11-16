@@ -232,3 +232,54 @@ def first_line_summary(text: str, limit: int = 140) -> str:
         if len(s) >= 3:
             return (s[: limit - 1] + "…") if len(s) > limit else s
     return ""
+
+
+_PAGE_NO_LINE = re.compile(r"^\s*(?:page|p\.|slide|seite|página|page n°)?\s*\d{1,4}\s*(?:/\s*\d{1,4}|of\s+\d{1,4})?\s*$", re.I)
+
+
+def normalize_page_text(text: str) -> str:
+    """Normalise for duplicate checks: keeps digits (they carry content, e.g. a
+    filled-in table on a build-up slide) but drops lines that are only a page or
+    slide number."""
+    t = unicodedata.normalize("NFKC", text).lower()
+    lines = [ln for ln in t.splitlines() if ln.strip() and not _PAGE_NO_LINE.match(ln)]
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+_TOKEN_RE = re.compile(r"[^\W_]+(?:[.,/][0-9]+)*", re.U)
+
+
+def content_tokens(text: str) -> set:
+    """Words (3+ letters) and numbers, lowercased: a cheap fingerprint of what a
+    page says, used to compare readings of the same page."""
+    t = unicodedata.normalize("NFKC", text or "").lower()
+    out = set()
+    for tok in _TOKEN_RE.findall(t):
+        if tok.isdigit() or any(c.isdigit() for c in tok):
+            out.add(tok)
+        elif len(tok) >= 3:
+            out.add(tok)
+    return out
+
+
+def overlap(a: set, b: set) -> float:
+    """Share of the smaller set found in the larger one (0..1)."""
+    if not a or not b:
+        return 0.0
+    small, big = (a, b) if len(a) <= len(b) else (b, a)
+    return len(small & big) / len(small)
+
+
+def clip(text: str, limit: int) -> str:
+    """Shorten at a sentence end, else at a word boundary, never mid-word."""
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    ends = [m.end() for m in re.finditer(r"[.!?;](?=\s|$)", cut)]
+    if ends and ends[-1] >= limit * 0.5:
+        return cut[:ends[-1]].rstrip()
+    sp = cut.rfind(" ")
+    if sp >= limit * 0.5:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:-") + "…"

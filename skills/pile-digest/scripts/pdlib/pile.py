@@ -10,10 +10,10 @@ from typing import Callable, Dict, List, Optional
 
 from . import config, converters, inventory, registry, triage
 from .lock import PileLock
-from .util import (PileDigestError, eprint, free_bytes, is_writable_dir, now_iso, read_json, sha256_text,
+from .util import (PileDigestError, eprint, free_bytes, now_iso, read_json, sha256_text,
                    write_json)
 
-TRIAGE_VERSION = 4
+TRIAGE_VERSION = 5
 SKILL_DIR = Path(__file__).resolve().parents[2]
 PROMPTS_DIR = SKILL_DIR / "prompts"
 
@@ -84,14 +84,6 @@ class Pile:
     def work_dir(self, doc_id: str) -> Path:
         return self.dir / "work" / doc_id
 
-    def output_dir(self) -> Path:
-        name = self.cfg.get("output_dirname", "pile-digest")
-        if self.cfg.get("output_location", "pile") == "pile" and self.mode == "tree" and is_writable_dir(self.root):
-            return self.root / name
-        if self.cfg.get("output_location", "pile") == "pile" and self.mode == "loose" and is_writable_dir(self.root):
-            return self.root / f"{name}-loose"
-        return self.dir / "outputs"
-
     def lock(self) -> PileLock:
         return PileLock(self.dir / "run.lock", f"pile '{self.name}'")
 
@@ -111,9 +103,12 @@ class Pile:
     def overrides(self) -> dict:
         return read_json(self.overrides_path, {}) or {}
 
-    def set_override(self, page_id: str, cls: str, why: str) -> None:
+    def set_override(self, page_id: str, cls: str, why: str, auto: bool = False) -> None:
+        """Pin a page's class. auto=True for the pipeline's own decisions (e.g. a
+        garbled text layer): those still give way to duplicate detection, while a
+        class set by hand always wins."""
         ov = self.overrides()
-        ov[page_id] = {"cls": cls, "why": why}
+        ov[page_id] = {"cls": cls, "why": why, **({"auto": True} if auto else {})}
         write_json(self.overrides_path, ov)
 
     def pages(self, include_docs: Optional[set] = None, raw: bool = False) -> List[dict]:
@@ -136,10 +131,14 @@ class Pile:
                 c = classes.get(p["page_id"])
                 if c:
                     p.update(c)
-                if p["page_id"] in ov:
-                    p["cls"] = ov[p["page_id"]]["cls"]
-                    p["why"] = ov[p["page_id"]]["why"]
-                    p["pinned"] = True
+                o = ov.get(p["page_id"])
+                if o:
+                    auto = bool(o.get("auto")) or o.get("why") == "text layer looked garbled to the summariser"
+                    if not (auto and c and c.get("cls") == "duplicate"):
+                        p["cls"] = o["cls"]
+                        p["why"] = o["why"]
+                        p.pop("dup_of", None)
+                    p["pinned"] = "auto" if auto else "hand"
                 p["relpath"] = d["relpath"]
                 out.append(p)
         return out
@@ -293,7 +292,6 @@ class Pile:
         st = self.state()
         return {
             "pile": self.entry,
-            "output_dir": str(self.output_dir()),
             "docs": len(idx.get("docs", [])),
             "pages": len(pages),
             "classes": triage.counts(pages),

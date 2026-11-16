@@ -25,13 +25,23 @@ DEFAULTS: dict = {
     # by the API anyway, so rendering larger only wastes tokens.
     "render_long_side": 1568,
     "triage_dpi": 24,
-    "tile_rows": 2,              # escalation splits a page into this many tiles
+    "tile_rows": 2,              # the "tiles" level splits a page into this many tiles
     "keep_renders": False,
     "min_free_disk_mb": 500,
     # Summaries for pages whose text layer is already good.
     "summarize_text_pages": True,
-    # Guards. budget_tokens caps one run (input + cache + output, all models).
+    # Levels a flagged page climbs after the bulk reading (the main model comes
+    # last). "tiles" = cheap model on high-resolution tiles; opt-in, since it
+    # rarely helps with handwriting: ["tiles", "strong"].
+    "escalation_ladder": ["strong"],
+    # Worker prompt caching. Off: each call has new images, so cache writes
+    # were almost never read back and cost more than plain input.
+    "worker_prompt_cache": False,
+    # Guards. budget_tokens caps one run (input + cache writes + output, all models).
     "budget_tokens": None,
+    # A run stops and asks again once spend since approval passes the approved
+    # amount times this factor.
+    "run_overrun_factor": 1.25,
     # Stop before the next call once the 5-hour window is this full (0..1).
     "max_window_utilization": 0.92,
     # Pilot and verification.
@@ -53,14 +63,8 @@ DEFAULTS: dict = {
     "math_pages_use_vision": True,
     # Very tall pages (aspect ratio above this) are tiled even on first pass.
     "tall_page_ratio": 2.2,
-    # Where outputs go: "pile" (inside the pile folder) or "state".
-    "output_location": "pile",
-    "output_dirname": "pile-digest",
     # Extra ignore globs (on top of built-in junk patterns and .pile-digest-ignore).
     "ignore": [],
-    # Output profiles (see references/profiles.md). User profiles may add a
-    # "post_build" command list, run with the output folder as working dir.
-    "profiles": {},
 }
 
 
@@ -126,6 +130,13 @@ def validate(cfg: dict) -> None:
         cfg["max_window_utilization"] = min(1.0, max(0.05, f))
     except (TypeError, ValueError):
         cfg["max_window_utilization"] = DEFAULTS["max_window_utilization"]
+    try:
+        cfg["run_overrun_factor"] = min(5.0, max(1.0, float(cfg.get("run_overrun_factor", 1.25))))
+    except (TypeError, ValueError):
+        cfg["run_overrun_factor"] = DEFAULTS["run_overrun_factor"]
+    lad = cfg.get("escalation_ladder")
+    if not isinstance(lad, list) or not [x for x in lad if x in ("tiles", "strong")]:
+        cfg["escalation_ladder"] = list(DEFAULTS["escalation_ladder"])
     if cfg.get("budget_tokens") is not None:
         try:
             cfg["budget_tokens"] = int(cfg["budget_tokens"])

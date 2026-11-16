@@ -15,7 +15,25 @@ def record(path: Path, **fields) -> None:
 
 
 def total_tokens(r: dict) -> int:
-    return int(r.get("input", 0)) + int(r.get("cache_create", 0)) + int(r.get("cache_read", 0)) + int(r.get("output", 0))
+    """Tokens spent by one call: input + cache writes + output. Cache reads are
+    reported separately everywhere (they are much cheaper)."""
+    return int(r.get("input", 0) or 0) + int(r.get("cache_create", 0) or 0) + int(r.get("output", 0) or 0)
+
+
+def row_count(path: Path) -> int:
+    return len(read_jsonl(path))
+
+
+def spent_since(path: Path, approval: Optional[dict]) -> int:
+    """Tokens spent by calls recorded after an approval. Counted by ledger
+    position (exact), or by timestamp for approvals from older versions."""
+    if not approval:
+        return 0
+    rows = read_jsonl(path)
+    if approval.get("ledger_rows") is not None:
+        return sum(total_tokens(r) for r in rows[int(approval["ledger_rows"]):])
+    ts = approval.get("at")
+    return sum(total_tokens(r) for r in rows if ts and str(r.get("ts", "")) >= ts)
 
 
 def summarize(path: Path, since: Optional[str] = None) -> dict:
@@ -41,7 +59,8 @@ def summarize(path: Path, since: Optional[str] = None) -> dict:
     return {
         "by": {k: dict(v) for k, v in by.items()},
         "total": total,
-        "total_tokens": sum(total[k] for k in ("input", "cache_create", "cache_read", "output")),
+        "total_tokens": sum(total[k] for k in ("input", "cache_create", "output")),
+        "cache_read_tokens": total["cache_read"],
         "cost_usd": round(cost, 4),
         "calls": calls,
         "last_rate": last_rate,
@@ -56,7 +75,7 @@ def per_page_stats(path: Path, stage_prefix: str = "") -> dict:
         cls = r.get("cls") or "mixed"
         a = agg[(r.get("stage"), cls)]
         a["pages"] += int(r.get("pages", 0) or 0)
-        a["input"] += int(r.get("input", 0) or 0) + int(r.get("cache_create", 0) or 0) + int(r.get("cache_read", 0) or 0)
+        a["input"] += int(r.get("input", 0) or 0) + int(r.get("cache_create", 0) or 0)
         a["output"] += int(r.get("output", 0) or 0)
         a["cost"] += float(r.get("cost_usd", 0) or 0)
         a["calls"] += 1

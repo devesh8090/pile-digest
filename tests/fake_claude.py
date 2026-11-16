@@ -9,7 +9,10 @@ Behaviour is controlled with FAKE_CLAUDE_BEHAVIOUR:
   auth           not logged in
   drop_last      the last page of each batch is missing from the answer
   mismatch       spot checks report a mismatch with a correction
+  noimage        batches of several pages claim the images did not arrive
+  swap           the cheap model struggles; the stronger model returns another page's content
 FAKE_CLAUDE_LOG, if set, is a file that gets one line per call.
+FAKE_CLAUDE_EXTRA_TOKENS adds that many input tokens to every call (to test spend caps).
 """
 import json
 import os
@@ -36,7 +39,9 @@ if sid:
     ids = [sid.group(1)]
 if os.environ.get("FAKE_CLAUDE_LOG"):
     with open(os.environ["FAKE_CLAUDE_LOG"], "a") as f:
-        f.write(json.dumps({"model": model, "ids": ids, "images": images, "system": system[:40]}) + "\n")
+        f.write(json.dumps({"model": model, "ids": ids, "images": images, "system": system[:40],
+                            "earlier": any("EARLIER TRANSCRIPTION" in t for t in texts),
+                            "env_no_cache": os.environ.get("DISABLE_PROMPT_CACHING")}) + "\n")
 
 
 def emit(ev):
@@ -69,6 +74,21 @@ for pid in ids:
                        f"CORRECTED:\nCorrected text for {pid}\n=== END PAGE {pid} ===")
         else:
             out.append(f"=== PAGE {pid} ===\nVERDICT: match\nDIFFERENCES:\n- none\nCORRECTED:\nnone\n=== END PAGE {pid} ===")
+    elif "transcriber" in system and behaviour == "noimage" and len(ids) > 1:
+        out.append(f"=== PAGE {pid} ===\nKIND: transcription\nCONFIDENCE: low\nSUMMARY: The page image did not arrive; "
+                   f"only the page label was received.\nTOPICS: none\nFLAGS:\n- illegible: whole page; no image data "
+                   f"received\nCONTENT:\n[[ILLEGIBLE]]\n=== END PAGE {pid} ===")
+    elif "transcriber" in system and behaviour == "swap":
+        if model == "haiku":
+            body = ("Graphical method: maximise Z = -2x1 + 3x2 subject to x1 + x2 <= 5, x2 <= 4.5, optimum point "
+                    "(0.5, 4.5) with Zopt = 12.5, feasible region shaded, corner points listed [[ILLEGIBLE: 7?]]")
+            conf, flags = "low", "- illegible: one label"
+        else:
+            body = ("Theorem: every basic feasible solution of a linear programme is an extreme point of the convex "
+                    "set of feasible solutions. Proof by contradiction using linear independence of columns.")
+            conf, flags = "high", "- none"
+        out.append(f"=== PAGE {pid} ===\nKIND: transcription\nCONFIDENCE: {conf}\nSUMMARY: Page {pid}.\n"
+                   f"TOPICS: testing\nFLAGS:\n{flags}\nCONTENT:\n{body}\n=== END PAGE {pid} ===")
     elif "transcriber" in system:
         ill = behaviour == "illegible" and model == "haiku"
         conf = "low" if ill else "high"
@@ -82,7 +102,7 @@ for pid in ids:
     else:
         out.append(f"=== PAGE {pid} ===\nSUMMARY: Summary of {pid}.\nTOPICS: alpha, beta\nFLAGS:\n- none\n=== END PAGE {pid} ===")
 text = "\n\n".join(out)
-n_in = 300 * images + 50 * len(ids)
+n_in = 300 * images + 50 * len(ids) + int(os.environ.get("FAKE_CLAUDE_EXTRA_TOKENS", "0"))
 emit({"type": "result", "subtype": "success", "is_error": False, "result": text, "stop_reason": "end_turn",
       "total_cost_usd": 0.0001 * len(ids), "usage": {"input_tokens": 5, "cache_creation_input_tokens": n_in,
       "cache_read_input_tokens": 100, "output_tokens": 120 * max(1, len(ids))},

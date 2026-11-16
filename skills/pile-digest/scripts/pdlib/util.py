@@ -16,6 +16,11 @@ from typing import Any, Iterable, Optional, Sequence
 CHUNK = 1 << 20
 
 
+# A top-level folder with this name inside a pile is never read as part of the
+# pile, so derived work written there (notes, summaries) is not ingested.
+DERIVED_DIRNAME = "pile-digest"
+
+
 class PileDigestError(Exception):
     """An error with a message meant for the user (no traceback needed)."""
 

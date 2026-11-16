@@ -1,7 +1,7 @@
 {
   "name": "pile-digest",
-  "version": "1.0.0",
-  "description": "Understand large, messy document piles cheaply: local triage, a cheap model for bulk reading, a compact digest for the main model.",
+  "version": "2.0.0",
+  "description": "Understand large, messy document piles cheaply and carefully: local triage, a cheap model for bulk reading, verified escalation, and a compact digest for the main model.",
   "author": {
     "name": "Devesh Singh Chauhan",
     "url": "https://github.com/devesh8090"
@@ -13,7 +13,7 @@
     "documents",
     "pdf",
     "ocr",
-    "study-notes",
+    "document-understanding",
     "summarization",
     "token-efficiency",
     "skill"

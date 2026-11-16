@@ -84,7 +84,13 @@ def _classify_error(text: str, status) -> str:
     return "crash"
 
 
-def call(model: str, system_prompt: str, blocks: List[dict], *, timeout: float = 600) -> WorkerResult:
+def call(model: str, system_prompt: str, blocks: List[dict], *, timeout: float = 600,
+         prompt_cache: bool = False) -> WorkerResult:
+    """One fresh single-turn call.
+
+    Prompt caching is off by default: every worker call is a new process with
+    different images, so cache writes (billed above plain input) were almost
+    never read back. Measured: the same image call costs about half without it."""
     res = WorkerResult()
     if not claude_bin():
         res.error_kind = "no_cli"
@@ -94,6 +100,10 @@ def call(model: str, system_prompt: str, blocks: List[dict], *, timeout: float =
     payload = (json.dumps(msg) + "\n").encode()
     env = dict(os.environ)
     env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    if prompt_cache:
+        env.pop("DISABLE_PROMPT_CACHING", None)
+    else:
+        env["DISABLE_PROMPT_CACHING"] = "1"
     t0 = time.time()
     r = run(build_command(model, system_prompt), input_bytes=payload, timeout=timeout, env=env)
     res.duration_ms = int((time.time() - t0) * 1000)
