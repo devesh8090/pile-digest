@@ -30,6 +30,34 @@ Reading hundreds of pages with the most capable model is slow and expensive, and
 | The expensive model reads full transcriptions just to find its way around | It reads a **digest** of about 40 tokens per page (outline, page summaries, flags) and opens full pages only where needed |
 | Hard pages read at the same level as easy ones | A **ladder**, for flagged pages only: a stronger model (which corrects the cheap reading rather than starting over), then the main model |
 
+## In numbers
+
+These come from one real field run on a 288-page pile: 11 PDFs, including two handwritten notebooks (107 pages), five slide decks and typed notes. The worker figures were measured by the 1.0 pipeline's own ledger. The 2.0 digest was rebuilt from the same results. The raw numbers are in [`docs/stats/data.json`](docs/stats/data.json), and `python3 docs/stats/make_charts.py` redraws the charts.
+
+| | |
+|---|---|
+| Pages | **288**: 5 skipped or free, 95 from text layers, 188 read from images |
+| Worker spend | **1.65M tokens**, $2.63 API-price equivalent (about **$0.009 per page**), including the pilot |
+| Main model's map of the pile | **6.2k-token** digest overview (20k with every per-file page list), instead of an estimated **413k** to read the pile itself |
+| Main-model page reads | 25 page images opened during review, out of 288 |
+| Source errors found | **22**, each recorded with how it was checked |
+
+<p align="center"><img src="docs/stats/main-model.svg" alt="Bar chart: the main model reads a 6.2k-token digest overview (20k with every file) instead of an estimated 413k tokens for the whole pile" width="760"></p>
+
+<p align="center"><img src="docs/stats/triage.svg" alt="Stacked bar: of 288 pages, 5 were skipped or free, 95 had a good text layer and 188 were read from the image" width="760"></p>
+
+<p align="center"><img src="docs/stats/stages.svg" alt="Bar chart of worker tokens per stage in the 1.0 run: bulk reading 805k, high-res tiles 379k (removed in 2.0), re-reads 267k, section summaries 47k, spot checks 42k" width="760"></p>
+
+<p align="center"><img src="docs/stats/caching.svg" alt="Bar chart: one image call cost $0.00045 with prompt caching and $0.00023 without" width="760"></p>
+
+**What 2.0 changed because of these numbers:**
+- **Tiles stage removed.** It used about a quarter of the tokens and resolved few handwritten pages.
+- **Prompt caching off.** One image call now costs about half as much.
+- **Smaller digest.** It is split so the overview fits in a single read.
+- **Spend cap.** Spend is capped at 1.25× what you approved.
+
+Handwriting-heavy piles cost more than typed ones, because more pages need the stronger model. A pile of clean slides or scans sits much nearer the cheap end.
+
 ## Careful, not just cheap
 
 A wrong transcription of a formula is worse than none, so the pipeline is built to surface doubt rather than hide it:

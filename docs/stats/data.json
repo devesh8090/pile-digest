@@ -1,0 +1,36 @@
+{
+  "_about": "Numbers from one real field run of pile-digest 1.0 (the ledger and results of that run), plus the 2.0 digest rebuilt from the same results. Rebuild the charts with: python3 docs/stats/make_charts.py",
+  "pile": {
+    "pages": 288,
+    "files": 11,
+    "mix": "two handwritten notebooks (107 pages), five slide decks, typed notes, and a few short scanned excerpts"
+  },
+  "triage": [
+    {"label": "Skipped or free", "pages": 5, "note": "blank, duplicate, repeated title"},
+    {"label": "Good text layer", "pages": 95, "note": "cheap summary only"},
+    {"label": "Read from the image", "pages": 188, "note": "cheap model, flagged pages escalated"}
+  ],
+  "main_model_reading": [
+    {"label": "Reading the pile (estimate)", "tokens": 412600, "kind": "baseline", "note": "estimate: every page image and text layer"},
+    {"label": "1.0 digest", "tokens": 30000, "kind": "digest", "note": "measured"},
+    {"label": "2.0 digest, every file", "tokens": 20300, "kind": "digest", "note": "measured: overview + per-file pages"},
+    {"label": "2.0 digest overview", "tokens": 6200, "kind": "digest", "note": "measured: what is read first"}
+  ],
+  "stages": [
+    {"label": "Bulk reading", "model": "Haiku", "tokens": 805000, "usd": 0.29},
+    {"label": "High-res tiles", "model": "Haiku", "tokens": 379000, "usd": 0.13, "removed_in": "2.0"},
+    {"label": "Re-reads of hard pages", "model": "Sonnet", "tokens": 267000, "usd": 1.53},
+    {"label": "Section summaries", "model": "Sonnet", "tokens": 47000, "usd": 0.25},
+    {"label": "Spot checks", "model": "Sonnet", "tokens": 42000, "usd": 0.22}
+  ],
+  "totals": {
+    "worker_tokens": 1650000,
+    "usd_api_equivalent": 2.63,
+    "pages_opened_by_main_model": 25,
+    "source_errors_confirmed": 22
+  },
+  "caching": [
+    {"label": "Prompt caching on (1.0)", "usd": 0.00045},
+    {"label": "Prompt caching off (2.0)", "usd": 0.00023}
+  ]
+}
